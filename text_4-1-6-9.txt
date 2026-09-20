@@ -10886,13 +10886,113 @@ MainTab:AddKeybind("TurnbindKeybind", {
 end
 
 local lagswitchEnabled = false
+local LAGSWITCH_MODE = "auto"  -- "auto", "fflag", or "freeze"
+
+-- === FFLAG LAGSWITCH MOVABLE BUTTON (MOBILE + PC) ===
+local lagSwitchGui = Instance.new("ScreenGui")
+lagSwitchGui.Name = "LagSwitchGui"
+lagSwitchGui.ResetOnSpawn = false
+lagSwitchGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+lagSwitchGui.IgnoreGuiInset = true
+lagSwitchGui.Parent = player:WaitForChild("PlayerGui")
+
+local flagButton = Instance.new("TextButton")
+flagButton.Name = "FLAG"
+flagButton.Size = UDim2.new(0, 90, 0, 55)
+flagButton.Position = UDim2.new(1, -110, 0.35, 0)
+flagButton.AnchorPoint = Vector2.new(0, 0)
+flagButton.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+flagButton.BackgroundTransparency = 0.4
+flagButton.Text = "FLAG"
+flagButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+flagButton.TextSize = 18
+flagButton.Font = Enum.Font.GothamBold
+flagButton.Visible = false
+flagButton.Active = true
+flagButton.Selectable = false
+flagButton.AutoButtonColor = false
+flagButton.ZIndex = 10
+flagButton.Parent = lagSwitchGui
+
+local flagCorner = Instance.new("UICorner")
+flagCorner.CornerRadius = UDim.new(0, 10)
+flagCorner.Parent = flagButton
+
+local flagStroke = Instance.new("UIStroke")
+flagStroke.Color = Color3.fromRGB(80, 80, 80)
+flagStroke.Thickness = 1.5
+flagStroke.Parent = flagButton
+
+local flagLocked = false
+local flagDragging = false
+local flagDragStart = nil
+local flagStartPos = nil
+local flagHoldToken = 0
+local HOLD_TIME = 2
+local MOVE_THRESHOLD = 25
+
+-- ========================
+-- LAGSWITCH LOGIC
+-- ========================
+
+-- Detect if setfflag is actually usable
+local fflagAvailable = false
+pcall(function()
+    if type(setfflag) == "function" and type(getfflag) == "function" then
+        setfflag("MaxMissedWorldStepsRemembered", "1")
+        fflagAvailable = true
+    end
+end)
+
+-- Client-side freeze (works everywhere including mobile)
+local function clientFreeze(duration)
+    local start = os.clock()
+    while os.clock() - start < duration do
+    end
+end
+
+local freezeLoopRunning = false
+
+local function startFreezeLoop()
+    if freezeLoopRunning then return end
+    freezeLoopRunning = true
+    task.spawn(function()
+        while lagswitchEnabled and not fflagAvailable do
+            clientFreeze(0.05)  -- 50ms freeze each cycle
+            task.wait(0.01)
+        end
+        freezeLoopRunning = false
+    end)
+end
+
+local function applyLagswitchState(state)
+    lagswitchEnabled = state
+
+    if fflagAvailable then
+        -- PC: use the fflag
+        pcall(function()
+            if state then
+                setfflag("MaxMissedWorldStepsRemembered", "1000")
+            else
+                setfflag("MaxMissedWorldStepsRemembered", "1")
+            end
+        end)
+    else
+        -- Mobile: use client freeze loop
+        if state then
+            startFreezeLoop()
+        end
+        -- if false, loop exits naturally because lagswitchEnabled is false
+    end
+end
+
 task.spawn(function()
     while task.wait(5) do
-        if lagswitchEnabled then
+        if lagswitchEnabled and fflagAvailable then
             if getfflag and getfflag("MaxMissedWorldStepsRemembered") ~= "1000" then
-                setfflag("MaxMissedWorldStepsRemembered", "1000")
+                pcall(setfflag, "MaxMissedWorldStepsRemembered", "1000")
             elseif not getfflag then
-                setfflag("MaxMissedWorldStepsRemembered", "1000")
+                pcall(setfflag, "MaxMissedWorldStepsRemembered", "1000")
             end
         end
     end
@@ -10902,14 +11002,133 @@ LagswitchFFLAGToggleObject = MainTab:AddToggle("LagswitchFFLAGToggle", {
     Title = "FFlag for Lagswitch",
     Default = false,
     Callback = function(value)
-        lagswitchEnabled = value
-        if lagswitchEnabled then
-            setfflag("MaxMissedWorldStepsRemembered", "1000")
-        else
-            setfflag("MaxMissedWorldStepsRemembered", "1")
-        end
+        applyLagswitchState(value)
+        flagButton.Visible = value
     end,
 })
+
+-- ========================
+-- BUTTON UI
+-- ========================
+
+local function updateFlagAppearance()
+    if flagLocked then
+        flagButton.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        flagButton.Text = "FLAG 🔒"
+        flagStroke.Color = Color3.fromRGB(255, 100, 100)
+    elseif lagswitchEnabled then
+        flagButton.BackgroundColor3 = Color3.fromRGB(40, 180, 40)
+        flagButton.Text = "FLAG ON"
+        flagStroke.Color = Color3.fromRGB(100, 255, 100)
+    else
+        flagButton.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+        flagButton.Text = "FLAG"
+        flagStroke.Color = Color3.fromRGB(80, 80, 80)
+    end
+end
+
+local function toggleLagswitch()
+    local newState = not lagswitchEnabled
+    applyLagswitchState(newState)
+    if LagswitchFFLAGToggleObject then
+        syncToggle(LagswitchFFLAGToggleObject, newState)
+    end
+    updateFlagAppearance()
+    Fluent:Notify({
+        Title = "FFlag Lagswitch",
+        Content = newState and "Enabled" or "Disabled",
+        Duration = 1.2,
+    })
+end
+
+-- Detect mobile
+local isMobile = false
+pcall(function()
+    isMobile = UIS.TouchEnabled and not UIS.KeyboardEnabled
+end)
+
+flagButton.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and
+       input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    flagHoldToken += 1
+    local myToken = flagHoldToken
+    local stillPressed = true
+    local startTime = tick()
+
+    flagDragStart = input.Position
+    flagStartPos = flagButton.Position
+    flagDragging = not flagLocked
+
+    task.delay(HOLD_TIME, function()
+        if flagHoldToken ~= myToken then return end
+        if not stillPressed then return end
+
+        flagLocked = not flagLocked
+        flagDragging = false
+        updateFlagAppearance()
+        Fluent:Notify({
+            Title = "FFlag Lagswitch",
+            Content = flagLocked and "Button locked" or "Button unlocked",
+            Duration = 1.5,
+        })
+    end)
+
+    input.Changed:Connect(function()
+        if input.UserInputState == Enum.UserInputState.End then
+            stillPressed = false
+            local wasDragging = flagDragging
+            flagHoldToken += 1
+            flagDragging = false
+
+            local heldFor = tick() - startTime
+            local moved = 0
+            if flagDragStart then
+                local dx = input.Position.X - flagDragStart.X
+                local dy = input.Position.Y - flagDragStart.Y
+                moved = math.sqrt(dx * dx + dy * dy)
+            end
+
+            if heldFor < HOLD_TIME and moved < MOVE_THRESHOLD and not wasDragging then
+                toggleLagswitch()
+            end
+        end
+    end)
+end)
+
+local function onInputMove(input)
+    if not flagDragging then return end
+    if flagLocked then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and
+       input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    local delta = input.Position - flagDragStart
+    flagButton.Position = UDim2.new(
+        flagStartPos.X.Scale, flagStartPos.X.Offset + delta.X,
+        flagStartPos.Y.Scale, flagStartPos.Y.Offset + delta.Y
+    )
+end
+
+UIS.InputChanged:Connect(onInputMove)
+
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or
+       input.UserInputType == Enum.UserInputType.MouseButton1 then
+        flagHoldToken += 1
+        flagDragging = false
+    end
+end)
+
+-- Let the user know what mode is active
+task.defer(function()
+    task.wait(1)
+    Fluent:Notify({
+        Title = "Lagswitch Mode",
+        Content = fflagAvailable and "FFlag mode (PC)" or "Freeze mode (Mobile)",
+        Duration = 3,
+    })
+end)
+-- === END FFLAG LAGSWITCH BUTTON ===
 
 local SPECIAL_ROUND_NAMES = {
     "Slasher",
